@@ -22,11 +22,18 @@
 #include "cosa_rbus_apis.h"
 #include "voice_dhcp_hal.h"
 #include "syscfg/syscfg.h"
+#include <sys/ioctl.h>
+#include <stddef.h>
+#include <net/if.h>
 #include "telemetry_busmessage_sender.h"
 #include "cosa_voice_apis.h"
 
 #define MTA_ROUTE_TABLE_NAME "VOICE"
 #define RT_TABLES_FILE       "/etc/iproute2/rt_tables"
+#define VOICE_SUPPORT_MODE_IPV4_ONLY    "IPv4_Only"
+#define VOICE_SUPPORT_MODE_IPV6_ONLY    "IPv6_Only"
+#define VOICE_SUPPORT_MODE_DUAL_STACK   "Dual_Stack"
+#define  WAN_MANAGER_INTERFACE_ACTIVE_STATUS_PARAM "Device.X_RDK_WanManager.InterfaceActiveStatus"
 
 pthread_mutex_t voiceDataProcessingMutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -35,6 +42,59 @@ static pthread_mutex_t g_CosaMtaDhcpInfoMutex = PTHREAD_MUTEX_INITIALIZER;
 
 extern INT platform_hal_GetMTAMacAddress(CHAR *pValue);
 
+/* Last snapshot given to the voice HAL; IPv4 and IPv6 updates each refresh only their own part. Guarded by voiceDataProcessingMutex. */
+static VoiceInterfaceInfoType sVoiceInterfaceInfoCache;
+/* The DHCPv6 fields are the trailing block of VoiceInterfaceInfoType, starting at isIpv6Up. */
+#define VOICE_IPV6_BLOCK_OFFSET offsetof(VoiceInterfaceInfoType, isIpv6Up)
+/*
+ * @brief Check if the specified network interface is already up.
+ *
+ * This helper function checks whether the given network interface is
+ * currently in the "up" state by querying its flags via ioctl.
+ *
+ * @param[in] pIfaceName
+ *      Pointer to a null-terminated string containing the name of the
+ *      network interface to check (e.g., "mta0").
+ * @return
+ *      Returns true if the interface is up, false otherwise.
+*/
+static bool IsIfaceAlreadyUp(char *pIfaceName)
+{
+    bool isUp = false;
+    if (NULL == pIfaceName)
+    {
+        CcspTraceError(("%s: NULL parameters are passed \n", __FUNCTION__));
+        return false;
+    }
+
+    int iSocketFd = socket (AF_INET, SOCK_DGRAM, 0);
+    if (iSocketFd < 0)
+    {
+        CcspTraceError(("%s: socket creation failed\n", __FUNCTION__));
+        return false;
+    }
+
+    //Set the interface name
+    struct ifreq ifr = {0};
+    strncpy(ifr.ifr_name, pIfaceName, IFNAMSIZ-1);
+    ifr.ifr_name[IFNAMSIZ-1] = '\0';
+
+    // Check if interface exists
+    if (ioctl(iSocketFd, SIOCGIFFLAGS, &ifr) < 0)
+    {
+        CcspTraceError(("%s: ioctl SIOCGIFFLAGS failed for interface %s\n", __FUNCTION__, pIfaceName));
+        close(iSocketFd);
+        return false;
+    }
+    // Check if interface is up
+    if (ifr.ifr_flags & IFF_UP)
+    {
+        CcspTraceInfo(("%s: Interface %s is already up\n", __FUNCTION__, pIfaceName));
+        isUp = true;
+    }
+    close(iSocketFd);
+    return isUp;
+}
 /*
  * @brief Convert IP mode string to enum value.
 */
@@ -60,6 +120,179 @@ static IP_MODE convertIpMode(const char *pString)
     }
     return eIpMode;
 }
+
+/*
+ * @brief Check if the specified network interface has an IP address assigned.
+ *
+ * This helper function checks whether the given network interface has an IP address assigned by querying its address via ioctl.
+ *
+ * @param[in] pIfaceName
+ *      Pointer to a null-terminated string containing the name of the
+ *      network interface to check (e.g., "mta0").
+ * @param[in] dhcpVersion
+ *      The DHCP version to check for IP address assignment (DHCP_IPv4 or DHCP_IPv6).
+ *
+ * @return
+ *      Returns true if the interface has an IP address assigned, false otherwise.
+*/
+static bool isIfaceHasIp(char *pIfaceName, DhcpVersion dhcpVersion)
+{
+    bool hasIp = false;
+    if (NULL == pIfaceName || strlen(pIfaceName) >= IFNAMSIZ)
+    {
+        CcspTraceError(("%s: Invalid interface name\n", __FUNCTION__));
+        return false;
+    }
+
+    // Check if interface has IP address based on DHCP version
+    if (dhcpVersion == DHCP_IPv4)
+    {
+        int iSocketFd = socket (AF_INET, SOCK_DGRAM, 0);
+        if (iSocketFd < 0)
+        {
+            CcspTraceError(("%s: socket creation failed\n", __FUNCTION__));
+            return false;
+        }
+
+        //Set the interface name
+        struct ifreq ifr = {0};
+        strncpy(ifr.ifr_name, pIfaceName, IFNAMSIZ-1);
+        ifr.ifr_name[IFNAMSIZ-1] = '\0';
+        {
+            if (ioctl(iSocketFd, SIOCGIFADDR, &ifr) == 0)
+            {
+                CcspTraceInfo(("%s: Interface %s has IPv4 address assigned\n", __FUNCTION__, pIfaceName));
+                hasIp = true;
+            }
+        }
+        close(iSocketFd);
+    }
+    else if (dhcpVersion == DHCP_IPv6)
+    {
+        FILE *fp = fopen("/proc/net/if_inet6", "r");
+        if (NULL == fp)
+        {
+            CcspTraceError(("%s: Failed to open /proc/net/if_inet6\n", __FUNCTION__));
+            return false;
+        }
+
+        char addr6Str[33];
+        char ifaceNameBuf[IFNAMSIZ];
+        int ifindex, plen, scope, flags;
+
+        // Line format: ipv6_addr ifindex prefix_len scope flags ifacename
+        while (fscanf(fp, "%32s %02x %02x %02x %02x %20s",
+                      addr6Str, &ifindex, &plen, &scope, &flags, ifaceNameBuf) == 6)
+        {
+            // Match the interface name
+            if (strcmp(ifaceNameBuf, pIfaceName) == 0)
+            {
+                /*
+                 * Scope definitions in Linux kernel:
+                 * 0x00 = Global (IPV6_ADDR_GLOBAL)
+                 * 0x20 = Link-Local (IPV6_ADDR_LINKLOCAL)
+                 * 0x10 = Site-Local, 0x40 = Org-Local, 0x80 = Loopback
+                 */
+                if (scope == 0x00)
+                {
+                    CcspTraceInfo(("%s: Interface %s has a GLOBAL IPv6 address assigned\n", __FUNCTION__, pIfaceName));
+                    hasIp = true;
+                    break;
+                }
+            }
+        }
+        fclose(fp);
+    }
+    return hasIp;
+}
+/**
+ * @brief Check if EPON is active.
+ *
+ * This function checks the status of the EPON interface by querying
+ * the WAN manager component via RBUS. It returns true if EPON is active,
+ * false otherwise.
+ *
+ * @return
+ *      Returns true if EPON is active, false otherwise.
+ */
+static bool checkEponIsActive(void)
+{
+    char cValue[128] = {0};
+    getParamRetry(WAN_MANAGER_INTERFACE_ACTIVE_STATUS_PARAM, cValue, sizeof(cValue));
+    if ('\0' == cValue[0])
+    {
+        CcspTraceError(("%s: Failed to get WAN manager interface active status\n", __FUNCTION__));
+        return false;
+    }
+    if ((strstr(cValue, "EPON,1") != NULL) || (strstr(cValue, "WANOE,1") != NULL))
+    {
+       CcspTraceInfo(("%s: EPON or WANOE is active\n", __FUNCTION__));
+       return true;
+    }
+    else
+    {
+       CcspTraceInfo(("%s: EPON and WANOE are not active, skipping MTA interface creation\n", __FUNCTION__));
+       return false;
+    }
+}
+/*
+ * @brief Create the MTA network interface as a macvlan linked to the WAN interface.
+ * This function creates a macvlan interface with the specified name,
+ * assigns it the MAC address read from factory NVRAM, and brings the interface up.
+ * @param[in] pVoiceSupportIfaceName
+ *      Pointer to a null-terminated string containing the name of the
+ *      MTA network interface to create (e.g., "mta0").
+ * @return
+ *      Returns 0 on success, -1 on failure.
+*/
+static int createMtaInterface(char * pVoiceSupportIfaceName)
+{
+
+    char cMtaInterfaceMac[32] = {0};
+    char cWanIfname[32] = {0};
+
+    if (NULL == pVoiceSupportIfaceName)
+    {
+        CcspTraceError(("%s: NULL parameters are passed \n", __FUNCTION__));
+        return -1;
+    }
+
+    platform_hal_GetMTAMacAddress(cMtaInterfaceMac);
+    if (cMtaInterfaceMac[0] == '\0') {
+        CcspTraceError(("%s: readMacAddress failed to get MAC address\n", __FUNCTION__));
+        return -1;
+    }
+    CcspTraceInfo(("%s:%d, MTA MacVlan Mac is %s\n", __FUNCTION__, __LINE__, cMtaInterfaceMac));
+
+    if (false == checkEponIsActive())
+    {
+        return -1;
+    }
+    getWanIfaceName(cWanIfname, sizeof(cWanIfname));
+    if (cWanIfname[0] == '\0')
+        snprintf(cWanIfname, sizeof(cWanIfname), "erouter0");
+
+    if (false == IsIfaceAlreadyUp(pVoiceSupportIfaceName))
+    {
+        //Create the macVlan
+        CcspTraceInfo(("%s:%d, Creating macVlan interface %s with mac %s\n", __FUNCTION__, __LINE__, pVoiceSupportIfaceName, cMtaInterfaceMac));
+        char cCmd[128] = {0};
+        snprintf(cCmd, sizeof(cCmd), "ip link add link %s name %s type macvlan mode bridge", cWanIfname, pVoiceSupportIfaceName);
+        system(cCmd);
+        snprintf(cCmd, sizeof(cCmd), "ip link set dev %s address %s", pVoiceSupportIfaceName, cMtaInterfaceMac);
+        system(cCmd);
+        snprintf(cCmd, sizeof(cCmd), "ip link set dev %s up", pVoiceSupportIfaceName);
+        system(cCmd);
+        CcspTraceInfo(("%s:%d, Created macVlan interface %s\n", __FUNCTION__, __LINE__, pVoiceSupportIfaceName));
+    }
+    else
+    {
+        CcspTraceInfo(("%s:%d, MTA interface %s is already up, skipping creation\n", __FUNCTION__, __LINE__, pVoiceSupportIfaceName));
+    }
+    return 0;
+}
+
+
 /*
  * @brief Start the voice support feature by subscribing to DHCP client events.
  *
@@ -83,7 +316,10 @@ void startVoiceFeature(void)
         return;
     }
     syscfg_get(NULL, "VoiceSupport_Mode",cVoiceSupportMode, sizeof(cVoiceSupportMode));
-    if (0 == strlen(cVoiceSupportMode) || (strcmp(cVoiceSupportMode, "IPv4_Only") != 0 && strcmp(cVoiceSupportMode, "Dual_Stack") != 0))
+    if (0 == strlen(cVoiceSupportMode) ||
+    (strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_IPV4_ONLY) != 0 &&
+     strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_IPV6_ONLY) != 0 &&
+     strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_DUAL_STACK) != 0))
     {
         CcspTraceError(("%s:%d, VoiceSupport_Mode is not set to a valid value, skipping voice feature initialization\n", __FUNCTION__, __LINE__));
         return;
@@ -104,7 +340,60 @@ void startVoiceFeature(void)
             CcspTraceError(("%s:%d, Failed to set IP mode in voice HAL\n", __FUNCTION__, __LINE__));
         }
     }
+    char cVoiceSupportIfaceName[32] = {0};
+    syscfg_get(NULL, "VoiceSupport_IfaceName",cVoiceSupportIfaceName, sizeof(cVoiceSupportIfaceName));
+    if (cVoiceSupportIfaceName[0] == '\0')
+    {
+        CcspTraceWarning(("%s:%d, VoiceSupport_IfaceName not set in syscfg, using default mta0\n", __FUNCTION__, __LINE__));
+        snprintf(cVoiceSupportIfaceName, sizeof(cVoiceSupportIfaceName), "mta0");
+    }
+    if (createMtaInterface(cVoiceSupportIfaceName) == 0)
+    {
+        CcspTraceInfo(("%s:%d, MTA interface created successfully\n", __FUNCTION__, __LINE__));
+    } else {
+        CcspTraceError(("%s:%d, Failed to create MTA interface\n", __FUNCTION__, __LINE__));
+        return;
+    }
     subscribeDhcpClientEvents();
+
+    if (0 == strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_IPV4_ONLY) || (0 == strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_DUAL_STACK)) || (0 == strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_IPV6_ONLY)))
+    {
+        if (0 == strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_IPV4_ONLY) || 0 == strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_DUAL_STACK))
+        {
+            CcspTraceInfo(("%s:%d, Setting IPv4 enable on MTA interface through DHCP manager data model \n", __FUNCTION__, __LINE__));
+            if (false == isIfaceHasIp(cVoiceSupportIfaceName, DHCP_IPv4))
+                enableDhcpv4ForMta(cVoiceSupportIfaceName);
+        }
+
+        if (0 == strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_DUAL_STACK) || 0 == strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_IPV6_ONLY))
+        {
+            CcspTraceInfo(("%s:%d, Setting IPv6 enable on MTA interface through DHCP manager data model \n", __FUNCTION__, __LINE__));
+            if (false == isIfaceHasIp(cVoiceSupportIfaceName, DHCP_IPv6))
+                enableDhcpv6ForMta(cVoiceSupportIfaceName);
+        }
+    } else {
+        CcspTraceInfo(("%s:%d, VoiceSupport_Mode: %s is not set to %s or %s or %s, skipping udhcpc start\n",__FUNCTION__, __LINE__, cVoiceSupportMode, VOICE_SUPPORT_MODE_IPV4_ONLY, VOICE_SUPPORT_MODE_DUAL_STACK, VOICE_SUPPORT_MODE_IPV6_ONLY));
+    }
+}
+/**
+ * @brief stop the voice support feature by deleting the MTA interface and disabling DHCPv4 if necessary.
+ */
+void stopVoiceFeature(void)
+{
+    char cVoiceSupportIfaceName[32] = {0};
+
+    disableDhcpv4ForMta();
+    syscfg_get(NULL, "VoiceSupport_IfaceName",cVoiceSupportIfaceName, sizeof(cVoiceSupportIfaceName));
+    if (cVoiceSupportIfaceName[0] == '\0')
+    {
+        CcspTraceWarning(("%s:%d, VoiceSupport_IfaceName not set in syscfg, using default mta0\n", __FUNCTION__, __LINE__));
+        snprintf(cVoiceSupportIfaceName, sizeof(cVoiceSupportIfaceName), "mta0");
+    }
+    char cCmd[128] = {0};
+    snprintf(cCmd, sizeof(cCmd), "ip link delete %s", cVoiceSupportIfaceName);
+    system(cCmd);
+    CcspTraceInfo(("%s:%d, Deleted MTA interface %s\n", __FUNCTION__, __LINE__, cVoiceSupportIfaceName));
+    CcspTraceInfo(("%s:%d, Stopped voice support feature\n", __FUNCTION__, __LINE__));
 }
 
 /*
@@ -303,6 +592,42 @@ static int getOption122_SubOptions(uint8_t *pOption122Data, uint16_t iOption122L
 }
 
 /*
+ *@brief Cache the voice interface snapshot and hand it to the voice HAL (Comcast partner only).
+ *@param pInfo - Snapshot containing both the IPv4 and IPv6 state
+*/
+static void notifyVoiceInterfaceInfo(VoiceInterfaceInfoType *pInfo)
+{
+    sVoiceInterfaceInfoCache = *pInfo;
+
+    char cPartnerId[64] = { 0 };
+    syscfg_get(NULL, "PartnerID", cPartnerId, sizeof(cPartnerId));
+    if ('\0' != cPartnerId[0] && strcmp(cPartnerId, "sky-uk") != 0)
+    {
+        /*TODO: NEED TO REMOVE THE SLEEP
+         * As of now broadcom snmpd process is not starting during bootup
+         * Added a sleep of 10 seconds as a workaround
+         * Once we get the broadcom patch, we need to remove the sleep of 10 seconds */
+        if (0 == access("/nvram/add_sleep_bf_voice_hal_init", F_OK))
+        {
+            CcspTraceInfo(("%s:%d,Adding 10 seconds sleep before initializing voice support\n", __FUNCTION__, __LINE__));
+            sleep(10);
+        }
+        uint8_t ui8Ret = voice_hal_interface_info_notify(pInfo);
+        CcspTraceInfo(("%s:%d, voice_hal_interface_info_notify returned %u\n", __FUNCTION__, __LINE__, ui8Ret));
+        if (1 != ui8Ret)
+        {
+            CcspTraceError(("%s:%d, voice_hal_interface_info_notify failed to update voice interface info\n", __FUNCTION__, __LINE__));
+            t2_event_d("Failed to initialize the voice support", 1);
+            return;
+        }
+    }
+    else
+    {
+        CcspTraceInfo(("%s:%d, PartnerID is sky-uk, skipping voice_hal_interface_info_notify call\n", __FUNCTION__, __LINE__));
+    }
+}
+
+/*
  *@brief This function initializes the voice support related parameters based on DHCP event data
  *@param pDhcpEvtData - Pointer to the DHCP event data structure
 */
@@ -314,6 +639,9 @@ static void initializeVoiceSupport(DhcpEventData_t *pDhcpEvtData)
         return;
     }
     VoiceInterfaceInfoType sVoiceInterfaceInfoType = {0};
+    /* Keep the IPv6 state reported earlier */
+    memcpy((char *)&sVoiceInterfaceInfoType + VOICE_IPV6_BLOCK_OFFSET, (const char *)&sVoiceInterfaceInfoCache + VOICE_IPV6_BLOCK_OFFSET,
+           sizeof(sVoiceInterfaceInfoType) - VOICE_IPV6_BLOCK_OFFSET);
     snprintf(sVoiceInterfaceInfoType.intfName, sizeof(sVoiceInterfaceInfoType.intfName), "%s", pDhcpEvtData->cIfaceName);
     sVoiceInterfaceInfoType.isPhyUp = 1;
     sVoiceInterfaceInfoType.isIpv4Up = 1;
@@ -391,32 +719,60 @@ static void initializeVoiceSupport(DhcpEventData_t *pDhcpEvtData)
 
 
 
-    char cPartnerId[64] = { 0 };
-    syscfg_get(NULL, "PartnerID", cPartnerId, sizeof(cPartnerId));
-    if ('\0' != cPartnerId[0] && strcmp(cPartnerId, "comcast") == 0)
+    notifyVoiceInterfaceInfo(&sVoiceInterfaceInfoType);
+}
+
+/*
+ *@brief Report the DHCPv6 state of the voice interface to the voice HAL.
+ * Lease update/renew fills the IPv6 fields from the lease; lease delete, client stopped or failed clears them.
+ *@param pDhcpEvtData - Pointer to the DHCPv6 event data
+*/
+static void initializeVoiceSupportV6(DhcpEventData_t *pDhcpEvtData)
+{
+    if (NULL == pDhcpEvtData)
     {
-        /*TODO: NEED TO REMOVE THE SLEEP
-         * As of now broadcom snmpd process is not starting during bootup
-         * Added a sleep of 10 seconds as a workaround
-         * Once we get the broadcom patch, we need to remove the sleep of 10 seconds */
-        if (0 == access("/nvram/add_sleep_bf_voice_hal_init", F_OK))
+        CcspTraceError(("%s: NULL DHCP event data provided\n", __FUNCTION__));
+        return;
+    }
+    VoiceInterfaceInfoType sVoiceInterfaceInfoType = sVoiceInterfaceInfoCache; /* keeps the IPv4 state */
+    memset((char *)&sVoiceInterfaceInfoType + VOICE_IPV6_BLOCK_OFFSET, 0, sizeof(sVoiceInterfaceInfoType) - VOICE_IPV6_BLOCK_OFFSET);
+    snprintf(sVoiceInterfaceInfoType.intfName, sizeof(sVoiceInterfaceInfoType.intfName), "%s", pDhcpEvtData->cIfaceName);
+    sVoiceInterfaceInfoType.isPhyUp = 1;
+
+    if (DHCP_LEASE_UPDATE == pDhcpEvtData->dhcpMsgType || DHCP_LEASE_RENEW == pDhcpEvtData->dhcpMsgType)
+    {
+        const DHCP_MGR_IPV6_MSG *pLease = &pDhcpEvtData->leaseInfo.dhcpV6Msg;
+        if (pLease->addrAssigned && '\0' != pLease->address[0])
         {
-            CcspTraceInfo(("%s:%d,Adding 10 seconds sleep before initializing voice support\n", __FUNCTION__, __LINE__));
-            sleep(10);
+            sVoiceInterfaceInfoType.isIpv6Up = 1;
+            snprintf(sVoiceInterfaceInfoType.ipv6GlobalAddr, sizeof(sVoiceInterfaceInfoType.ipv6GlobalAddr), "%s", pLease->address);
+            CcspTraceInfo(("%s:%d, IPv6 address:%s assigned for %s interface\n", __FUNCTION__, __LINE__, sVoiceInterfaceInfoType.ipv6GlobalAddr, sVoiceInterfaceInfoType.intfName));
         }
-        uint8_t ui8Ret = voice_hal_interface_info_notify(&sVoiceInterfaceInfoType);
-        CcspTraceInfo(("%s:%d, voice_hal_interface_info_notify returned %u\n", __FUNCTION__, __LINE__, ui8Ret));
-        if (1 != ui8Ret)
+        snprintf(sVoiceInterfaceInfoType.v6DnsServers, sizeof(sVoiceInterfaceInfoType.v6DnsServers), "%s%s%s",
+                 pLease->nameserver, ('\0' != pLease->nameserver[0] && '\0' != pLease->nameserver1[0]) ? "," : "", pLease->nameserver1);
+        snprintf(sVoiceInterfaceInfoType.v6DomainName, sizeof(sVoiceInterfaceInfoType.v6DomainName), "%s", pLease->domainName);
+        if (pDhcpEvtData->hasVoiceV6Info)
         {
-            CcspTraceError(("%s:%d, voice_hal_interface_info_notify failed to update voice interface info\n", __FUNCTION__, __LINE__));
-            t2_event_d("Failed to initialize the voice support", 1);
-            return;
+            const DHCP_MGR_VOICE_V6_MSG *pVoice = &pDhcpEvtData->voiceV6Info;
+            snprintf(sVoiceInterfaceInfoType.v6TftpServerIp, sizeof(sVoiceInterfaceInfoType.v6TftpServerIp), "%s", pVoice->cTftpServer);
+            snprintf(sVoiceInterfaceInfoType.v6TftpFileName, sizeof(sVoiceInterfaceInfoType.v6TftpFileName), "%s", pVoice->cTftpFileName);
+            snprintf(sVoiceInterfaceInfoType.v6SyslogServerIp, sizeof(sVoiceInterfaceInfoType.v6SyslogServerIp), "%s", pVoice->cSyslogServer);
+            snprintf(sVoiceInterfaceInfoType.v6ProvServerIp, sizeof(sVoiceInterfaceInfoType.v6ProvServerIp), "%s", pVoice->cProvServer);
+            snprintf(sVoiceInterfaceInfoType.v6ClientFqdn, sizeof(sVoiceInterfaceInfoType.v6ClientFqdn), "%s", pVoice->cClientFqdn);
         }
     }
-    else
-    {
-        CcspTraceInfo(("%s:%d, PartnerID is not Comcast, skipping voice_hal_interface_info_notify call\n", __FUNCTION__, __LINE__));
-    }
+
+    CcspTraceInfo(("%s:%d, Updating Voice Support with following IPv6 details:\n", __FUNCTION__, __LINE__));
+    CcspTraceInfo(("%s:%d, Interface Name: %s, IPv6 up: %u\n", __FUNCTION__, __LINE__, sVoiceInterfaceInfoType.intfName, sVoiceInterfaceInfoType.isIpv6Up));
+    CcspTraceInfo(("%s:%d, IPv6 Address: %s\n", __FUNCTION__, __LINE__, sVoiceInterfaceInfoType.ipv6GlobalAddr));
+    CcspTraceInfo(("%s:%d, DNS Servers: %s\n", __FUNCTION__, __LINE__, sVoiceInterfaceInfoType.v6DnsServers));
+    CcspTraceInfo(("%s:%d, Domain Name: %s\n", __FUNCTION__, __LINE__, sVoiceInterfaceInfoType.v6DomainName));
+    CcspTraceInfo(("%s:%d, TFTP Server: %s, TFTP File: %s, Syslog Server: %s\n", __FUNCTION__, __LINE__,
+        sVoiceInterfaceInfoType.v6TftpServerIp, sVoiceInterfaceInfoType.v6TftpFileName, sVoiceInterfaceInfoType.v6SyslogServerIp));
+    CcspTraceInfo(("%s:%d, Provisioning Server: %s, Client FQDN: %s\n", __FUNCTION__, __LINE__,
+        sVoiceInterfaceInfoType.v6ProvServerIp, sVoiceInterfaceInfoType.v6ClientFqdn));
+
+    notifyVoiceInterfaceInfo(&sVoiceInterfaceInfoType);
 }
 
 static void processVoiceDhcpEvent(DhcpEventData_t *pDhcpEvtData)
@@ -507,6 +863,27 @@ void * dhcpClientEventsHandlerThread(void * pArg)
 
             default:
                 CcspTraceWarning(("%s: Unrecognized DHCPv4 message type %d\n", __FUNCTION__, pDhcpEvtData->dhcpMsgType));
+                break;
+        }
+    }
+    else if (DHCP_IPv6 == pDhcpEvtData->dhcpVersion)
+    {
+        switch (pDhcpEvtData->dhcpMsgType)
+        {
+            case DHCP_LEASE_UPDATE:
+            case DHCP_LEASE_RENEW:
+            case DHCP_LEASE_DEL:
+            case DHCP_CLIENT_STOPPED:
+            case DHCP_CLIENT_FAILED:
+            {
+                pthread_mutex_lock(&voiceDataProcessingMutex);
+                initializeVoiceSupportV6(pDhcpEvtData);
+                pthread_mutex_unlock(&voiceDataProcessingMutex);
+                break;
+            }
+
+            default:
+                CcspTraceWarning(("%s: Unrecognized DHCPv6 message type %d\n", __FUNCTION__, pDhcpEvtData->dhcpMsgType));
                 break;
         }
     }

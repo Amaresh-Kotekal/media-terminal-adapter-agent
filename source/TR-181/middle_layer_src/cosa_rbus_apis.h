@@ -47,6 +47,8 @@ typedef struct _DhcpEventData
         DHCP_MGR_IPV4_MSG dhcpV4Msg;
         DHCP_MGR_IPV6_MSG dhcpV6Msg;
     }leaseInfo;
+    DHCP_MGR_VOICE_V6_MSG voiceV6Info; /* DHCPv6 lease update/renew only; valid when hasVoiceV6Info is set */
+    bool hasVoiceV6Info;
 } DhcpEventData_t;
 /*
 * @brief Retrieve interface index information for the MTA interface.
@@ -68,6 +70,46 @@ void getIfaceIndexInfo(void);
  * on an active RBUS connection.
  */
 void initRbusHandle(void);
+
+/**
+ * @brief Enable or configure IPv4 DHCP for the specified MTA interface.
+ *
+ * This function enables DHCPv4 for the MTA (e.g., telephony) interface
+ * identified by the given interface name. The interface name must be a
+ * valid, null-terminated string referring to an existing network
+ * interface on the device.
+ * Also it updates the interface name parameter in DHCP manager via RBUS.
+ *
+ * @param[in] pIfaceName  Name of the MTA network interface for which
+ *                        DHCPv4 should be enabled.
+ */
+void enableDhcpv4ForMta(const char * pIfaceName);
+
+/**
+ * @brief Enable or configure IPv6 DHCP for the specified MTA interface.
+ *
+ * This function enables DHCPv6 for the MTA (e.g., telephony) interface
+ * identified by the given interface name. The interface name must be a
+ * valid, null-terminated string referring to an existing network
+ * interface on the device.
+ * Also it updates the interface name parameter in DHCP manager via RBUS.
+ *
+ * @param[in] pIfaceName  Name of the MTA network interface for which
+ *                        DHCPv6 should be enabled.
+ */
+void enableDhcpv6ForMta(const char * pIfaceName);
+
+/**
+ *@brief Disable DHCPv4 for the MTA interface.
+ */
+void disableDhcpv4ForMta(void);
+
+
+/**
+ *@brief Disable DHCPv6 for the MTA interface.
+ */
+void disableDhcpv6ForMta(void);
+
 /**
  * @brief Subscribe to DHCP client events for MTA interface.
  * This function sets up subscriptions to listen for DHCP client
@@ -75,5 +117,10 @@ void initRbusHandle(void);
  */
 void subscribeDhcpClientEvents(void);
 
+/**
+ *@brief get parameter vis RBUS with retry mechanism.
+ * This function attempts to get a parameter using RBUS and implements a retry mechanism in case of failure.
+ */
+void getParamRetry(const char * pParamName, char * pParamValue, size_t valueLen);
 #endif /* COSA_RBUS_APIS_H */
 

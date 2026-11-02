@@ -26,6 +26,8 @@
 
 
 #define  DHCPv4_VOICE_SUPPORT_PARAM "dmsb.voicesupport.Interface.IP.DHCPV4Interface"
+#define  DHCPv6_VOICE_SUPPORT_PARAM "dmsb.voicesupport.Interface.IP.DHCPV6Interface"
+
 #define  DHCP_MGR_DHCPv4_TABLE "Device.DHCPv4.Client"
 #define  DHCP_MGR_DHCPv6_TABLE "Device.DHCPv6.Client"
 
@@ -35,9 +37,139 @@
 rbusHandle_t voiceRbusHandle = NULL;
 extern  ANSC_HANDLE  bus_handle;
 const char cSubsystem[ ]= "eRT.";
-static char cBaseParam[32] = {0};
+static char cBaseParamIPv4[32] = {0};
+static char cBaseParamIPv6[32] = {0};
 
+/**
+* @brief Convert parameter value type to rbus value type.
+*
+* @param[in] paramType  Parameter value type to be converted.
+* @return Corresponding rbus value type.
+*/
 
+static rbusValueType_t convertRbusDataType(paramValueType_t paramType)
+{
+    rbusValueType_t rbusType = RBUS_NONE;
+    switch (paramType)
+    {
+        case BOOLEAN_PARAM:
+            rbusType = RBUS_BOOLEAN;
+            break;
+        case STRING_PARAM:
+            rbusType = RBUS_STRING;
+            break;
+        default:
+            CcspTraceWarning(("%s: Unsupported param type %d\n", __FUNCTION__, paramType));
+            break;
+    }
+    return rbusType;
+}
+
+/**
+ * @brief Set parameter in DHCP manager via RBUS.
+ *
+ * This function sets the specified parameter in the DHCP manager
+ * using RBUS. It constructs an rbus value from the provided parameter
+ * value and type, and performs the set operation. Errors during the
+ * process are logged appropriately.
+ *
+ * @param[in] pParamName   Name of the parameter to be set.
+ * @param[in] pParamValue  Value of the parameter to be set.
+ * @param[in] paramType    Type of the parameter value.
+*/
+static int setParamValue(const char * pParamName, const char * pParamValue, paramValueType_t paramType)
+{
+    if (voiceRbusHandle == NULL || pParamName == NULL || pParamValue == NULL)
+    {
+        CcspTraceError(("%s: Invalid rbus handle or NULL parameter\n", __FUNCTION__));
+        return -1;
+    }
+    int iRet = -1;
+    rbusValue_t rbusValue;
+    rbusValueType_t rbusType = convertRbusDataType(paramType);
+    if (rbusType == RBUS_NONE)
+    {
+        CcspTraceError(("%s: Unsupported param type %d for param %s\n", __FUNCTION__, paramType, pParamName));
+        return -1;
+    }
+
+    rbusValue_Init(&rbusValue);
+    if (false == rbusValue_SetFromString(rbusValue, rbusType, pParamValue))
+    {
+        CcspTraceError(("%s: rbusValue_SetFromString failed for param %s with value %s\n", __FUNCTION__, pParamName, pParamValue));
+        rbusValue_Release(rbusValue);
+        return -1;
+    }
+
+    iRet = rbus_set(voiceRbusHandle, pParamName, rbusValue, NULL);
+    if (iRet != RBUS_ERROR_SUCCESS)
+    {
+        CcspTraceError(("%s: rbus_set failed for param %s with error code %d\n", __FUNCTION__, pParamName, iRet));
+    }
+    else
+    {
+        CcspTraceInfo(("%s: rbus_set successful for param %s with value %s\n", __FUNCTION__, pParamName, pParamValue));
+    }
+    rbusValue_Release(rbusValue);
+    return (iRet == RBUS_ERROR_SUCCESS) ? 0 : -1;
+}
+
+/**
+ * @brief Retrieve parameter value from a component via RBUS.
+ *
+ * This function retrieves the value of the specified parameter from
+ * a component using RBUS. It initializes an rbus value, performs
+ * the get operation, and stores the result in the provided buffer.
+ * Errors during the process are logged appropriately.
+ *
+ * @param[in] pParamName   Name of the parameter to be retrieved.
+ * @param[out] pParamValue Buffer to store the retrieved parameter value.
+ * @param[in] valueSize    Size of the buffer.
+ */
+
+static int getParamValue(const char * pParamName, char * pParamValue, size_t valueSize)
+{
+    if (pParamName == NULL || pParamValue == NULL || valueSize == 0 || voiceRbusHandle == NULL)
+    {
+        CcspTraceError(("%s: Invalid parameter\n", __FUNCTION__));
+        return -1;
+    }
+    rbusValue_t rbusValue;
+    rbusValue_Init(&rbusValue);
+
+    int iRet = rbus_get(voiceRbusHandle, pParamName, &rbusValue);
+    if (iRet != RBUS_ERROR_SUCCESS)
+    {
+        CcspTraceError(("%s: rbus_get failed for param %s with error code %d\n", __FUNCTION__, pParamName, iRet));
+        rbusValue_Release(rbusValue);
+        return -1;
+    }
+    if (RBUS_STRING == rbusValue_GetType(rbusValue))
+    {
+        const char * pStrVal = rbusValue_GetString(rbusValue, NULL);
+        if (NULL != pStrVal)
+        {
+            snprintf(pParamValue, valueSize, "%s", pStrVal);
+            CcspTraceInfo(("%s: rbus_get successful for param %s with value %s\n", __FUNCTION__, pParamName, pParamValue));
+        }
+        else
+        {
+            CcspTraceError(("%s: rbus_get returned NULL string for param %s\n", __FUNCTION__, pParamName));
+        }
+    }
+    else if (RBUS_BOOLEAN == rbusValue_GetType(rbusValue))
+    {
+        bool boolVal = rbusValue_GetBoolean(rbusValue);
+        snprintf(pParamValue, valueSize, "%s", boolVal ? "true" : "false");
+        CcspTraceInfo(("%s: rbus_get successful for param %s with boolean value %s\n", __FUNCTION__, pParamName, pParamValue));
+    }
+    else
+    {
+        CcspTraceError(("%s: rbus_get returned non-string and non boolean type for param %s\n", __FUNCTION__, pParamName));
+    }
+    rbusValue_Release(rbusValue);
+    return (iRet == RBUS_ERROR_SUCCESS) ? 0 : -1;
+}
 /**
  * @brief Retrieve interface index information for the MTA interface.
  *
@@ -59,8 +191,7 @@ void getIfaceIndexInfo(void)
         CcspTraceError(("%s: PSM_Get_Record_Value2 failed for param %s with error code %d\n", __FUNCTION__, DHCPv4_VOICE_SUPPORT_PARAM,
             iRetPsmGet));
         /* Set a safe default base parameter to avoid constructing invalid RBUS paths later. */
-        snprintf(cBaseParam, sizeof(cBaseParam), "%s", DHCP_MGR_DHCPv4_TABLE);
-        return;
+        snprintf(cBaseParamIPv4, sizeof(cBaseParamIPv4), "%s", DHCP_MGR_DHCPv4_TABLE);
     }
     else
     {
@@ -69,12 +200,38 @@ void getIfaceIndexInfo(void)
         if (strlen(pParamValue) == 0)
         {
             CcspTraceWarning(("%s: Retrieved empty value for param %s, using default base parameter\n", __FUNCTION__, DHCPv4_VOICE_SUPPORT_PARAM));
-            snprintf(cBaseParam, sizeof(cBaseParam), "%s", DHCP_MGR_DHCPv4_TABLE);
+            snprintf(cBaseParamIPv4, sizeof(cBaseParamIPv4), "%s", DHCP_MGR_DHCPv4_TABLE);
         }
         else
         {
-            snprintf(cBaseParam, sizeof(cBaseParam), "%s",pParamValue);
+            snprintf(cBaseParamIPv4, sizeof(cBaseParamIPv4), "%s",pParamValue);
         }
+        CcspTraceInfo(("%s: Base parameter for IPv4 set to %s\n", __FUNCTION__, cBaseParamIPv4));
+        ((CCSP_MESSAGE_BUS_INFO *)bus_handle)->freefunc((char *)pParamValue);
+    }
+    pParamValue = NULL;
+    iRetPsmGet = CCSP_SUCCESS;
+    /* Retrieve interface index information for DHCPv6 as well */
+    iRetPsmGet = PSM_Get_Record_Value2(bus_handle, cSubsystem, DHCPv6_VOICE_SUPPORT_PARAM, NULL, &pParamValue);
+    if (iRetPsmGet != CCSP_SUCCESS)
+    {
+        CcspTraceError(("%s: PSM_Get_Record_Value2 failed for param %s with error code %d\n", __FUNCTION__, DHCPv6_VOICE_SUPPORT_PARAM,
+            iRetPsmGet));
+    }
+    else
+    {
+        CcspTraceInfo(("%s: PSM_Get_Record_Value2 successful for param %s with value %s\n", __FUNCTION__, DHCPv6_VOICE_SUPPORT_PARAM,
+            pParamValue));
+        if (strlen(pParamValue) == 0)
+        {
+            CcspTraceWarning(("%s: Retrieved empty value for param %s, using default base parameter\n", __FUNCTION__, DHCPv6_VOICE_SUPPORT_PARAM));
+            snprintf(cBaseParamIPv6, sizeof(cBaseParamIPv6), "%s", DHCP_MGR_DHCPv6_TABLE);
+        }
+        else
+        {
+            snprintf(cBaseParamIPv6, sizeof(cBaseParamIPv6), "%s",pParamValue);
+        }
+        CcspTraceInfo(("%s: Base parameter for IPv6 set to %s\n", __FUNCTION__, cBaseParamIPv6));
         ((CCSP_MESSAGE_BUS_INFO *)bus_handle)->freefunc((char *)pParamValue);
     }
 }
@@ -103,6 +260,262 @@ void initRbusHandle(void)
     }
     CcspTraceInfo(("%s: rbus_open successful\n", __FUNCTION__));
 }
+
+/**
+ *@brief get parameter vis RBUS with retry mechanism.
+ * This function attempts to get a parameter using RBUS and implements a retry mechanism in case of failure.
+ */
+
+void getParamRetry(const char * pParamName, char * pParamValue, size_t valueLen)
+{
+    if (pParamName == NULL || pParamValue == NULL || valueLen == 0 )
+    {
+        CcspTraceError(("%s: Invalid parameter\n", __FUNCTION__));
+        return;
+    }
+
+    int iRetryAttempt = 0;
+    int iSleepTime = 1; // Initial sleep time in seconds
+    while (iRetryAttempt < MAX_RETRY_ATTEMPTS)
+    {
+        if (getParamValue(pParamName, pParamValue, valueLen) == 0)
+        {
+            CcspTraceInfo(("%s: Successfully got param %s with value %s\n", __FUNCTION__, pParamName, pParamValue));
+            break;
+        }
+        else
+        {
+            iRetryAttempt++;
+            if (iRetryAttempt > MAX_RETRY_ATTEMPTS)
+            {
+                CcspTraceError(("%s: Failed to get param %s after %d attempts, giving up\n", __FUNCTION__, pParamName, iRetryAttempt));
+                t2_event_d("MTA_WAN_GET_FAIL_AfterRetries", 1);
+                break;
+            }
+            CcspTraceError(("%s: Failed to get param %s, retrying after %d seconds...\n", __FUNCTION__, pParamName, iSleepTime));
+            sleep(iSleepTime);
+            iSleepTime += RETRY_SLEEP_INCREMENT;
+        }
+    }
+}
+
+/**
+ * @brief Set parameter via RBUS with retry mechanism.
+ *
+ * This function attempts to set a parameter using RBUS and implements a retry mechanism in case of failure.
+ * It retries the set operation with incremental backoff (1s, 3s, 5s, 7s) up to a maximum number of attempts. All attempts
+ * are logged for debugging purposes.
+ */
+static void setParamRetry(const char * pParamName, const char * pParamValue, paramValueType_t paramType)
+{
+    if (NULL == pParamName || NULL == pParamValue)
+    {
+        CcspTraceError(("%s: Invalid parameter\n", __FUNCTION__));
+        return;
+    }
+
+    int iRetryAttempt = 0;
+    int iSleepTime = 1; // Initial sleep time in seconds
+
+    while (iRetryAttempt < MAX_RETRY_ATTEMPTS)
+    {
+        if (setParamValue(pParamName, pParamValue, paramType) == 0)
+        {
+            CcspTraceInfo(("%s: Successfully set param %s with value %s\n", __FUNCTION__, pParamName, pParamValue));
+            break;
+        }
+        else
+        {
+            iRetryAttempt++;
+            if (iRetryAttempt > MAX_RETRY_ATTEMPTS)
+            {
+                CcspTraceError(("%s: Failed to set param %s with value %s after %d attempts, giving up\n", __FUNCTION__, pParamName, pParamValue, iRetryAttempt));
+                t2_event_d("MTA_DHCP_ENABLE_FAIL_AfterRetries", 1);
+                break;
+            }
+            CcspTraceError(("%s: Failed to set param %s with value %s, retrying after %d seconds...\n", __FUNCTION__, pParamName, pParamValue, iSleepTime));
+            sleep(iSleepTime);
+            iSleepTime += RETRY_SLEEP_INCREMENT;
+        }
+    }
+}
+
+/**
+ * @brief Enable or configure IPv4 DHCP for the specified MTA interface.
+ *
+ * This function enables DHCPv4 for the MTA (e.g., telephony) interface
+ * identified by the given interface name. The interface name must be a
+ * valid, null-terminated string referring to an existing network
+ * interface on the device.
+ * Also it updates the interface name parameter in DHCP manager via RBUS.
+ *
+ * @param[in] pIfaceName  Name of the MTA network interface for which
+ *                        DHCPv4 should be enabled.
+ */
+void enableDhcpv4ForMta(const char * pIfaceName)
+{
+    char cParamName[64] = {0};
+    char cPartnerId[64] = { 0 };
+    syscfg_get(NULL, "PartnerID", cPartnerId, sizeof(cPartnerId));
+    if ('\0' != cPartnerId[0] && strcmp(cPartnerId, "sky-uk") != 0)
+    {
+        snprintf(cParamName, sizeof(cParamName), "%s.Interface", cBaseParamIPv4);
+        setParamRetry(cParamName, pIfaceName, STRING_PARAM);
+
+        snprintf(cParamName, sizeof(cParamName), "%s.Enable", cBaseParamIPv4);
+        setParamRetry(cParamName, "true", BOOLEAN_PARAM);
+    }
+    else
+    {
+        CcspTraceInfo(("%s: Partner ID:%s is sky-uk, skipping DHCPv4 configuration\n", __FUNCTION__, cPartnerId));
+    }
+}
+
+/**
+ * @brief Enable or configure IPv6 DHCP for the specified MTA interface.
+ *
+ * This function enables DHCPv6 for the MTA (e.g., telephony) interface
+ * identified by the given interface name. The interface name must be a
+ * valid, null-terminated string referring to an existing network
+ * interface on the device.
+ * Also it updates the interface name parameter in DHCP manager via RBUS.
+ *
+ * @param[in] pIfaceName  Name of the MTA network interface for which
+ *                        DHCPv6 should be enabled.
+ */
+void enableDhcpv6ForMta(const char * pIfaceName)
+{
+    char cParamName[64] = {0};
+    char cPartnerId[64] = { 0 };
+    syscfg_get(NULL, "PartnerID", cPartnerId, sizeof(cPartnerId));
+    if ('\0' != cPartnerId[0] && strcmp(cPartnerId, "sky-uk") != 0)
+    {
+        snprintf(cParamName, sizeof(cParamName), "%s.Interface", cBaseParamIPv6);
+        setParamRetry(cParamName, pIfaceName, STRING_PARAM);
+
+        snprintf(cParamName, sizeof(cParamName), "%s.Enable", cBaseParamIPv6);
+        setParamRetry(cParamName, "true", BOOLEAN_PARAM);
+    }
+    else
+    {
+        CcspTraceInfo(("%s: Partner ID:%s is sky-uk, skipping DHCPv6 enable\n", __FUNCTION__, cPartnerId));
+    }
+}
+
+/**
+ *@brief Disable DHCPv4 for the MTA interface.
+ */
+void disableDhcpv4ForMta(void)
+{
+    char cParamName[64] = {0};
+    char cPartnerId[64] = { 0 };
+    syscfg_get(NULL, "PartnerID", cPartnerId, sizeof(cPartnerId));
+    if ('\0' != cPartnerId[0] && strcmp(cPartnerId, "sky-uk") != 0)
+    {
+        snprintf(cParamName, sizeof(cParamName), "%s.Enable", cBaseParamIPv4);
+        setParamRetry(cParamName, "false", BOOLEAN_PARAM);
+    }
+    else
+    {
+        CcspTraceInfo(("%s: Partner ID:%s is sky-uk, skipping DHCPv4 disable\n", __FUNCTION__, cPartnerId));
+    }
+}
+
+/**
+ *@brief Disable DHCPv6 for the MTA interface.
+ */
+void disableDhcpv6ForMta(void)
+{
+    char cParamName[64] = {0};
+    char cPartnerId[64] = { 0 };
+    syscfg_get(NULL, "PartnerID", cPartnerId, sizeof(cPartnerId));
+    if ('\0' != cPartnerId[0] && strcmp(cPartnerId, "sky-uk") != 0)
+    {
+        snprintf(cParamName, sizeof(cParamName), "%s.Enable", cBaseParamIPv6);
+        setParamRetry(cParamName, "false", BOOLEAN_PARAM);
+    }
+    else
+    {
+        CcspTraceInfo(("%s: Partner ID:%s is sky-uk, skipping DHCPv6 disable\n", __FUNCTION__, cPartnerId));
+    }
+}
+
+/**
+ * @brief Extract the DHCPv6 lease payload from a DHCP manager event.
+ *
+ * Only lease update/renew events carry LeaseInfo. Lease delete, client stopped and
+ * client failed events are accepted without a payload so the voice IPv6 state gets cleared.
+ *
+ * @param[in]     dataObj      Event data object.
+ * @param[in,out] pDhcpEvtData Event data; leaseInfo.dhcpV6Msg is filled for update/renew.
+ * @return true if the event has to be processed further, false otherwise.
+ */
+static bool getDhcpv6EventLeaseInfo(rbusObject_t dataObj, DhcpEventData_t *pDhcpEvtData)
+{
+    switch (pDhcpEvtData->dhcpMsgType)
+    {
+        case DHCP_LEASE_UPDATE:
+        case DHCP_LEASE_RENEW:
+        {
+            int iByteLen = 0;
+            rbusValue_t rbusValue = rbusObject_GetValue(dataObj, "LeaseInfo");
+            const uint8_t *pLeaseInfo = (NULL != rbusValue) ? rbusValue_GetBytes(rbusValue, &iByteLen) : NULL;
+            if (NULL == pLeaseInfo || (size_t)iByteLen != sizeof(DHCP_MGR_IPV6_MSG))
+            {
+                CcspTraceError(("%s: Invalid DHCPv6 LeaseInfo, size %d (expected %zu)\n", __FUNCTION__, iByteLen, sizeof(DHCP_MGR_IPV6_MSG)));
+                return false;
+            }
+
+            DHCP_MGR_IPV6_MSG *pLease = &pDhcpEvtData->leaseInfo.dhcpV6Msg;
+            memcpy(pLease, pLeaseInfo, sizeof(DHCP_MGR_IPV6_MSG));
+            pLease->address[sizeof(pLease->address) - 1] = '\0';
+            pLease->nameserver[sizeof(pLease->nameserver) - 1] = '\0';
+            pLease->nameserver1[sizeof(pLease->nameserver1) - 1] = '\0';
+            pLease->domainName[sizeof(pLease->domainName) - 1] = '\0';
+
+            CcspTraceInfo(("%s:%d, DHCPv6 Lease Info - Ifname: %s, Address: %s, AddrAssigned: %d\n",
+                __FUNCTION__, __LINE__, pLease->ifname, pLease->address, pLease->addrAssigned));
+            CcspTraceInfo(("%s:%d, DHCPv6 Lease Info - DNS Server: %s, DNS Server1: %s, DomainName: %s\n",
+                __FUNCTION__, __LINE__, pLease->nameserver, pLease->nameserver1, pLease->domainName));
+
+            struct in6_addr addr6;
+            if (pLease->addrAssigned && inet_pton(AF_INET6, pLease->address, &addr6) != 1)
+            {
+                CcspTraceError(("%s: Invalid IPv6 address format in LeaseInfo: %s\n", __FUNCTION__, pLease->address));
+                return false;
+            }
+
+            /* Optional: only sent when the lease carries option 17 sub-options or option 39 */
+            int iVoiceLen = 0;
+            rbusValue_t voiceValue = rbusObject_GetValue(dataObj, "VoiceInfo");
+            const uint8_t *pVoiceInfo = (NULL != voiceValue) ? rbusValue_GetBytes(voiceValue, &iVoiceLen) : NULL;
+            if (NULL != pVoiceInfo && (size_t)iVoiceLen == sizeof(DHCP_MGR_VOICE_V6_MSG))
+            {
+                DHCP_MGR_VOICE_V6_MSG *pVoice = &pDhcpEvtData->voiceV6Info;
+                memcpy(pVoice, pVoiceInfo, sizeof(DHCP_MGR_VOICE_V6_MSG));
+                pVoice->cTftpServer[sizeof(pVoice->cTftpServer) - 1] = '\0';
+                pVoice->cTftpFileName[sizeof(pVoice->cTftpFileName) - 1] = '\0';
+                pVoice->cSyslogServer[sizeof(pVoice->cSyslogServer) - 1] = '\0';
+                pVoice->cProvServer[sizeof(pVoice->cProvServer) - 1] = '\0';
+                pVoice->cClientFqdn[sizeof(pVoice->cClientFqdn) - 1] = '\0';
+                pDhcpEvtData->hasVoiceV6Info = true;
+            }
+            else if (NULL != pVoiceInfo)
+            {
+                CcspTraceError(("%s: Invalid DHCPv6 VoiceInfo size %d (expected %zu)\n", __FUNCTION__, iVoiceLen, sizeof(DHCP_MGR_VOICE_V6_MSG)));
+            }
+            return true;
+        }
+        case DHCP_LEASE_DEL:
+        case DHCP_CLIENT_STOPPED:
+        case DHCP_CLIENT_FAILED:
+            return true;
+        default:
+            CcspTraceInfo(("%s: No action for DHCPv6 Message Type %d\n", __FUNCTION__, pDhcpEvtData->dhcpMsgType));
+            return false;
+    }
+}
+
 /**
  * @brief DHCP client events handler for MTA interface.
  *
@@ -211,7 +624,16 @@ static void dhcpClientEventsHandler(rbusHandle_t voiceRbusHandle, rbusEvent_t co
 
         CcspTraceInfo(("%s: DHCP Message Type %d\n", __FUNCTION__, pDhcpEvtData->dhcpMsgType));
 
-        if (DHCP_LEASE_UPDATE == pDhcpEvtData->dhcpMsgType || DHCP_LEASE_RENEW == pDhcpEvtData->dhcpMsgType || DHCP_LEASE_DEL == pDhcpEvtData->dhcpMsgType || \
+        if (DHCP_IPv6 == pDhcpEvtData->dhcpVersion)
+        {
+            if (false == getDhcpv6EventLeaseInfo(dataObj, pDhcpEvtData))
+            {
+                CcspTraceError(("%s: Failed to get DHCPv6 event lease info\n", __FUNCTION__));
+                free(pDhcpEvtData);
+                return;
+            }
+        }
+        else if (DHCP_LEASE_UPDATE == pDhcpEvtData->dhcpMsgType || DHCP_LEASE_RENEW == pDhcpEvtData->dhcpMsgType || DHCP_LEASE_DEL == pDhcpEvtData->dhcpMsgType || \
             DHCP_CLIENT_STARTED == pDhcpEvtData->dhcpMsgType || DHCP_CLIENT_STOPPED == pDhcpEvtData->dhcpMsgType || DHCP_CLIENT_FAILED == pDhcpEvtData->dhcpMsgType)
         {
             int iByteLen = 0;
@@ -308,10 +730,15 @@ static void dhcpClientEventsHandler(rbusHandle_t voiceRbusHandle, rbusEvent_t co
 
 void * eventSubscriptionThread(void * pArg)
 {
-    (void)pArg; // Unused parameter
+    const char *pBaseParam = (const char *)pArg; // cBaseParamIPv4 or cBaseParamIPv6
     char cEventName[64] = {0};
 
-    snprintf(cEventName, sizeof(cEventName), "%s.Events", cBaseParam);
+    if (NULL == pBaseParam || '\0' == pBaseParam[0])
+    {
+        CcspTraceError(("%s: Event base parameter is empty, cannot subscribe\n", __FUNCTION__));
+        return NULL;
+    }
+    snprintf(cEventName, sizeof(cEventName), "%s.Events", pBaseParam);
     CcspTraceInfo(("%s:%d, Subscribing to DHCP client events for MTA interface with event name %s\n", __FUNCTION__, __LINE__, cEventName));
 
     rbusEventSubscription_t rbusEventSubscription = {
@@ -326,11 +753,6 @@ void * eventSubscriptionThread(void * pArg)
         .publishOnSubscribe = true
     };
 
-    if ('\0' == cEventName[0])
-    {
-        CcspTraceError(("%s: Event name is empty, cannot subscribe\n", __FUNCTION__));
-        return NULL;
-    }
     CcspTraceInfo(("%s:%d, Subscribing to event %s in event subscription thread\n", __FUNCTION__, __LINE__, rbusEventSubscription.eventName));
     while (1)
     {
@@ -363,11 +785,15 @@ void subscribeDhcpClientEvents(void)
         return;
     }
 
-    pthread_t eventSubscriptionThreadId = -1;
-    if (pthread_create(&eventSubscriptionThreadId, NULL, (void *)eventSubscriptionThread, NULL) != 0)
+    char * const pBaseParams[] = { cBaseParamIPv4, cBaseParamIPv6 };
+    for (size_t i = 0; i < sizeof(pBaseParams) / sizeof(pBaseParams[0]); i++)
     {
-        CcspTraceError(("%s: Failed to create event subscription thread\n", __FUNCTION__));
-        return;
+        pthread_t eventSubscriptionThreadId = 0;
+        if (pthread_create(&eventSubscriptionThreadId, NULL, eventSubscriptionThread, pBaseParams[i]) != 0)
+        {
+            CcspTraceError(("%s: Failed to create event subscription thread for %s\n", __FUNCTION__, pBaseParams[i]));
+            continue;
+        }
+        pthread_detach(eventSubscriptionThreadId);
     }
-    pthread_detach(eventSubscriptionThreadId);
 }
