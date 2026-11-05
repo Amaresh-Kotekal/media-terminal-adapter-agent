@@ -354,7 +354,7 @@ void startVoiceFeature(void)
         CcspTraceError(("%s:%d, Failed to create MTA interface\n", __FUNCTION__, __LINE__));
         return;
     }
-    subscribeDhcpClientEvents();
+    subscribeDhcpClientEvents(cVoiceSupportMode);
 
     if (0 == strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_IPV4_ONLY) || (0 == strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_DUAL_STACK)) || (0 == strcmp(cVoiceSupportMode, VOICE_SUPPORT_MODE_IPV6_ONLY)))
     {

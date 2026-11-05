@@ -113,9 +113,10 @@ void disableDhcpv6ForMta(void);
 /**
  * @brief Subscribe to DHCP client events for MTA interface.
  * This function sets up subscriptions to listen for DHCP client
- * events related to the MTA interface.
+ * events related to the MTA interface based on the voice support mode.
+ * @param[in] pVoiceSupportMode Voice support mode (IPv4_Only, IPv6_Only, or Dual_Stack)
  */
-void subscribeDhcpClientEvents(void);
+void subscribeDhcpClientEvents(const char *pVoiceSupportMode);
 
 /**
  *@brief get parameter vis RBUS with retry mechanism.

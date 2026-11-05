@@ -31,6 +31,10 @@
 #define  DHCP_MGR_DHCPv4_TABLE "Device.DHCPv4.Client"
 #define  DHCP_MGR_DHCPv6_TABLE "Device.DHCPv6.Client"
 
+#define VOICE_SUPPORT_MODE_IPV4_ONLY    "IPv4_Only"
+#define VOICE_SUPPORT_MODE_IPV6_ONLY    "IPv6_Only"
+#define VOICE_SUPPORT_MODE_DUAL_STACK   "Dual_Stack"
+
 #define MAX_RETRY_ATTEMPTS 5
 #define RETRY_SLEEP_INCREMENT 2
 
@@ -774,10 +778,11 @@ void * eventSubscriptionThread(void * pArg)
 /**
  * @brief Subscribe to DHCP client events for MTA interface.
  * This function sets up subscriptions to listen for DHCP client
- * events related to the MTA interface.
+ * events related to the MTA interface based on the voice support mode.
+ * @param[in] pVoiceSupportMode Voice support mode (IPv4_Only, IPv6_Only, or Dual_Stack)
  */
 
-void subscribeDhcpClientEvents(void)
+void subscribeDhcpClientEvents(const char *pVoiceSupportMode)
 {
     if (NULL == voiceRbusHandle)
     {
@@ -785,15 +790,43 @@ void subscribeDhcpClientEvents(void)
         return;
     }
 
-    char * const pBaseParams[] = { cBaseParamIPv4, cBaseParamIPv6 };
-    for (size_t i = 0; i < sizeof(pBaseParams) / sizeof(pBaseParams[0]); i++)
+    if (NULL == pVoiceSupportMode || '\0' == pVoiceSupportMode[0])
     {
-        pthread_t eventSubscriptionThreadId = 0;
-        if (pthread_create(&eventSubscriptionThreadId, NULL, eventSubscriptionThread, pBaseParams[i]) != 0)
+        CcspTraceError(("%s: Invalid voice support mode\n", __FUNCTION__));
+        return;
+    }
+
+    pthread_t eventSubscriptionThreadId = 0;
+
+    if (0 == strcmp(pVoiceSupportMode, VOICE_SUPPORT_MODE_IPV4_ONLY) ||
+        0 == strcmp(pVoiceSupportMode, VOICE_SUPPORT_MODE_DUAL_STACK))
+    {
+        if ('\0' != cBaseParamIPv4[0])
         {
-            CcspTraceError(("%s: Failed to create event subscription thread for %s\n", __FUNCTION__, pBaseParams[i]));
-            continue;
+            if (pthread_create(&eventSubscriptionThreadId, NULL, eventSubscriptionThread, cBaseParamIPv4) != 0)
+            {
+                CcspTraceError(("%s: Failed to create event subscription thread for %s\n", __FUNCTION__, cBaseParamIPv4));
+            }
+            else
+            {
+                pthread_detach(eventSubscriptionThreadId);
+            }
         }
-        pthread_detach(eventSubscriptionThreadId);
+    }
+
+    if (0 == strcmp(pVoiceSupportMode, VOICE_SUPPORT_MODE_IPV6_ONLY) ||
+        0 == strcmp(pVoiceSupportMode, VOICE_SUPPORT_MODE_DUAL_STACK))
+    {
+        if ('\0' != cBaseParamIPv6[0])
+        {
+            if (pthread_create(&eventSubscriptionThreadId, NULL, eventSubscriptionThread, cBaseParamIPv6) != 0)
+            {
+                CcspTraceError(("%s: Failed to create event subscription thread for %s\n", __FUNCTION__, cBaseParamIPv6));
+            }
+            else
+            {
+                pthread_detach(eventSubscriptionThreadId);
+            }
+        }
     }
 }
