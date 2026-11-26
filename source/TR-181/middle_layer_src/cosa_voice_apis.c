@@ -293,6 +293,27 @@ static int createMtaInterface(char * pVoiceSupportIfaceName)
 }
 
 
+static bool isVlanManagerRunning(void)
+{
+    int result = system("pidof VlanManager >/dev/null 2>&1");
+    if (result != -1 && WIFEXITED(result))
+    {
+        if (WEXITSTATUS(result) == 0)
+        {
+            return true;
+        }
+        if (WEXITSTATUS(result) == 1)
+        {
+            CcspTraceError(("%s: VlanManager is not running\n", __FUNCTION__));
+            return false;
+        }
+    }
+
+    /* Leave interface ownership unchanged when process detection fails. */
+    CcspTraceError(("%s: Failed to check VlanManager status, skipping interface and DHCP changes\n", __FUNCTION__));
+    return true;
+}
+
 /*
  * @brief Start the voice support feature by subscribing to DHCP client events.
  *
@@ -347,6 +368,12 @@ void startVoiceFeature(void)
         CcspTraceWarning(("%s:%d, VoiceSupport_IfaceName not set in syscfg, using default mta0\n", __FUNCTION__, __LINE__));
         snprintf(cVoiceSupportIfaceName, sizeof(cVoiceSupportIfaceName), "mta0");
     }
+    if (isVlanManagerRunning())
+    {
+        CcspTraceInfo(("%s: Leaving interface creation and DHCP configuration to VlanManager\n", __FUNCTION__));
+        subscribeDhcpClientEvents(cVoiceSupportMode);
+        return;
+    }
     if (createMtaInterface(cVoiceSupportIfaceName) == 0)
     {
         CcspTraceInfo(("%s:%d, MTA interface created successfully\n", __FUNCTION__, __LINE__));
@@ -382,6 +409,11 @@ void stopVoiceFeature(void)
 {
     char cVoiceSupportIfaceName[32] = {0};
 
+    if (isVlanManagerRunning())
+    {
+        CcspTraceInfo(("%s: Leaving interface and DHCP teardown to VlanManager\n", __FUNCTION__));
+        return;
+    }
     disableDhcpv4ForMta();
     syscfg_get(NULL, "VoiceSupport_IfaceName",cVoiceSupportIfaceName, sizeof(cVoiceSupportIfaceName));
     if (cVoiceSupportIfaceName[0] == '\0')
